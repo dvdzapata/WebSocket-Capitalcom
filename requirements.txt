@@ -1,0 +1,6 @@
+requests
+websocket-client
+psycopg2-binary
+aiohttp
+websockets
+python-dotenv
