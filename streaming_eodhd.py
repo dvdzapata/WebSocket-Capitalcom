@@ -547,14 +547,39 @@ async def run(settings: Settings) -> None:
 
     stop_event = asyncio.Event()
 
-    def _handle_signal(signame: str) -> None:
-        LOGGER.warning("Señal %s recibida. Cerrando...")
+    def _notify_stop(signame: str) -> None:
+        if stop_event.is_set():
+            return
+        LOGGER.warning("Señal %s recibida. Cerrando...", signame)
         stop_event.set()
 
+    def _sync_signal_handler(signum: int, frame) -> None:  # type: ignore[override]
+        try:
+            signame = signal.Signals(signum).name
+        except Exception:
+            signame = str(signum)
+        _notify_stop(signame)
+
     loop = asyncio.get_running_loop()
-    for signame in {"SIGTERM", "SIGINT"}:
-        if hasattr(signal, signame):
-            loop.add_signal_handler(getattr(signal, signame), _handle_signal, signame)
+    for signame in ("SIGTERM", "SIGINT"):
+        if not hasattr(signal, signame):
+            continue
+        sig = getattr(signal, signame)
+        try:
+            loop.add_signal_handler(sig, _notify_stop, signame)
+        except NotImplementedError:
+            LOGGER.info(
+                "add_signal_handler no disponible en esta plataforma. Usando signal.signal para %s",
+                signame,
+            )
+            signal.signal(sig, _sync_signal_handler)
+        except RuntimeError as exc:
+            LOGGER.warning(
+                "No se pudo registrar handler asíncrono para %s (%s). Usando signal.signal",
+                signame,
+                exc,
+            )
+            signal.signal(sig, _sync_signal_handler)
 
     async def _stop_on_event() -> None:
         await stop_event.wait()
