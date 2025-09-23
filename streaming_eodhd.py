@@ -66,6 +66,7 @@ class Settings:
     heartbeat: int = 120
     symbol_suffix: str = ".US"
     inactivity_timeout: int = 60
+    activity_log_interval: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -91,6 +92,7 @@ class Settings:
         heartbeat = int(os.getenv("WS_HEARTBEAT_SECONDS", "120"))
         suffix = os.getenv("EOD_SYMBOL_SUFFIX", ".US")
         inactivity_timeout = int(os.getenv("WS_INACTIVITY_TIMEOUT", "60"))
+        activity_log_interval = int(os.getenv("WS_ACTIVITY_LOG_INTERVAL", "60"))
 
         return cls(
             api_token=os.environ["API_TOKEN"].strip(),
@@ -104,6 +106,7 @@ class Settings:
             heartbeat=heartbeat,
             symbol_suffix=suffix,
             inactivity_timeout=inactivity_timeout,
+            activity_log_interval=activity_log_interval,
         )
 
 
@@ -294,6 +297,17 @@ def timestamp_from_ms(ms: Optional[int]) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _safe_float(value: Optional[object]) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_price(value: Optional[float]) -> str:
+    return "N/A" if value is None else f"{value:.4f}"
+
+
 class WebSocketWorker:
     def __init__(
         self,
@@ -314,6 +328,8 @@ class WebSocketWorker:
         self._session: Optional[aiohttp.ClientSession] = None
         self._closing = asyncio.Event()
         self._last_message_at = time.monotonic()
+        self._processed_messages = 0
+        self._last_activity_log = time.monotonic()
 
     async def start(self) -> None:
         while not self._closing.is_set():
@@ -415,6 +431,23 @@ class WebSocketWorker:
     async def process_payload(self, data: Dict[str, object]) -> None:  # pragma: no cover - overwritten
         raise NotImplementedError
 
+    def _register_activity(self, description: str) -> None:
+        self._processed_messages += 1
+        now = time.monotonic()
+        if self._processed_messages == 1:
+            LOGGER.info("%s: primer mensaje recibido -> %s", self.name, description)
+            self._last_activity_log = now
+            return
+
+        if now - self._last_activity_log >= self.settings.activity_log_interval:
+            LOGGER.info(
+                "%s: %s mensajes procesados. Último -> %s",
+                self.name,
+                self._processed_messages,
+                description,
+            )
+            self._last_activity_log = now
+
 
 class TradesWorker(WebSocketWorker):
     async def process_payload(self, data: Dict[str, object]) -> None:
@@ -426,6 +459,12 @@ class TradesWorker(WebSocketWorker):
         mapping = self.mappings.get(str(symbol_remote))
         if not mapping:
             LOGGER.warning("Trade recibido para símbolo no mapeado: %s", symbol_remote)
+            return
+
+        try:
+            price_value = float(price)
+        except (TypeError, ValueError):
+            LOGGER.warning("Trade con precio inválido para %s: %s", symbol_remote, price)
             return
 
         volume_raw = data.get("v", 0)
@@ -452,7 +491,7 @@ class TradesWorker(WebSocketWorker):
         event_ts = timestamp_from_ms(data.get("t"))
 
         LOGGER.debug(
-            "Persistiendo trade %s %.4f x %s", mapping.local_symbol, float(price), size
+            "Persistiendo trade %s %.4f x %s", mapping.local_symbol, price_value, size
         )
         try:
             await asyncio.to_thread(
@@ -460,12 +499,15 @@ class TradesWorker(WebSocketWorker):
                 asset_id=mapping.asset_id,
                 symbol=mapping.local_symbol,
                 session=market_session(),
-                price=float(price),
+                price=price_value,
                 size=size,
                 condition_code=condition_code,
                 dark_pool=dark_pool,
                 market_status=market_status,
                 event_timestamp=event_ts,
+            )
+            self._register_activity(
+                f"{mapping.local_symbol} {price_value:.4f} x {size}"
             )
         except Exception as exc:
             LOGGER.error(
@@ -487,8 +529,8 @@ class QuotesWorker(WebSocketWorker):
             LOGGER.warning("Quote recibido para símbolo no mapeado: %s", symbol_remote)
             return
 
-        bid_price = data.get("bp")
-        ask_price = data.get("ap")
+        bid_price = _safe_float(data.get("bp"))
+        ask_price = _safe_float(data.get("ap"))
         bid_size_raw = data.get("bs", 0)
         ask_size_raw = data.get("as", 0)
         try:
@@ -514,11 +556,15 @@ class QuotesWorker(WebSocketWorker):
                 asset_id=mapping.asset_id,
                 symbol=mapping.local_symbol,
                 session=market_session(),
-                bid_price=float(bid_price) if bid_price is not None else None,
-                ask_price=float(ask_price) if ask_price is not None else None,
+                bid_price=bid_price,
+                ask_price=ask_price,
                 bid_size=bid_size,
                 ask_size=ask_size,
                 event_timestamp=event_ts,
+            )
+            self._register_activity(
+                f"{mapping.local_symbol} bid={_format_price(bid_price)} "
+                f"ask={_format_price(ask_price)}"
             )
         except Exception as exc:
             LOGGER.error(

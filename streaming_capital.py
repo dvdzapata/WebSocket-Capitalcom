@@ -80,6 +80,7 @@ class Config:
     ping_interval_seconds: int = 300
     reconnect_delay_seconds: int = 5
     inactivity_timeout_seconds: int = 60
+    activity_log_interval_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -116,6 +117,9 @@ class Config:
             ping_interval_seconds=int(os.environ.get("CAPITAL_PING_INTERVAL", "300")),
             reconnect_delay_seconds=int(os.environ.get("CAPITAL_RECONNECT_DELAY", "5")),
             inactivity_timeout_seconds=int(os.environ.get("CAPITAL_INACTIVITY_TIMEOUT", "60")),
+            activity_log_interval_seconds=int(
+                os.environ.get("CAPITAL_ACTIVITY_LOG_INTERVAL", "60")
+            ),
         )
 
         if not cfg.target_epics:
@@ -144,6 +148,8 @@ class CapitalWebSocketStreamer:
             daemon=True,
         )
         self.watchdog_thread.start()
+        self.processed_messages = 0
+        self._last_activity_log = time.monotonic()
 
     def _create_db_connection(self) -> psycopg2.extensions.connection:
         self.logger.info("Connecting to PostgreSQL %s:%s", self.config.db_host, self.config.db_port)
@@ -445,8 +451,42 @@ class CapitalWebSocketStreamer:
                 record["timestamp"].isoformat(),
                 record["asset_id"],
             )
+            self._log_progress(record)
         except Exception as exc:
             self.logger.error("Failed to persist record: %s", exc, exc_info=True)
+
+    def _log_progress(self, record: Dict[str, object]) -> None:
+        self.processed_messages += 1
+        symbol = record.get("symbol", "?")
+
+        def _fmt(value: Optional[float]) -> str:
+            if value is None:
+                return "N/A"
+            try:
+                return f"{float(value):.4f}"
+            except (TypeError, ValueError):
+                return str(value)
+
+        description = (
+            f"{symbol} bid={_fmt(record.get('precio_compra'))} "
+            f"ask={_fmt(record.get('precio_venta'))}"
+        )
+        now = time.monotonic()
+        if self.processed_messages == 1:
+            self.logger.info("Primer quote recibido: %s", description)
+            self._last_activity_log = now
+            return
+
+        if now - self._last_activity_log >= self.config.activity_log_interval_seconds:
+            ts = record.get("timestamp")
+            ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
+            self.logger.info(
+                "Quotes procesados: %s. Último %s a %s",
+                self.processed_messages,
+                symbol,
+                ts_str,
+            )
+            self._last_activity_log = now
 
     def stop(self) -> None:
         self.stop_event.set()
