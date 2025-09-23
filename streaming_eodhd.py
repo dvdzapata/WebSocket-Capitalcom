@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timezone
 from typing import Dict, List, Optional
@@ -18,25 +19,25 @@ from psycopg2.pool import SimpleConnectionPool
 
 load_dotenv()
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 LOGGER = logging.getLogger("EODHD_WS")
-LOGGER.setLevel(LOG_LEVEL)
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(
-    logging.Formatter(
-        json.dumps(
-            {
-                "ts": "%(asctime)s",
-                "level": "%(levelname)s",
-                "service": "EODHD_WS",
-                "module": "%(module)s",
-                "msg": "%(message)s",
-            }
-        )
-    )
-)
-if not LOGGER.handlers:
-    LOGGER.addHandler(handler)
+
+
+def configure_logging() -> None:
+    """Configure root logging with a consistent format."""
+
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = logging.getLevelName(level_name)
+    if isinstance(level, str):
+        level = logging.INFO
+
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        root_logger.addHandler(handler)
+    root_logger.setLevel(level)
+    LOGGER.setLevel(level)
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class Settings:
     reconnect_delay: int = 5
     heartbeat: int = 120
     symbol_suffix: str = ".US"
+    inactivity_timeout: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -88,6 +90,7 @@ class Settings:
         reconnect_delay = int(os.getenv("RECONNECT_DELAY", "5"))
         heartbeat = int(os.getenv("WS_HEARTBEAT_SECONDS", "120"))
         suffix = os.getenv("EOD_SYMBOL_SUFFIX", ".US")
+        inactivity_timeout = int(os.getenv("WS_INACTIVITY_TIMEOUT", "60"))
 
         return cls(
             api_token=os.environ["API_TOKEN"].strip(),
@@ -100,6 +103,7 @@ class Settings:
             reconnect_delay=reconnect_delay,
             heartbeat=heartbeat,
             symbol_suffix=suffix,
+            inactivity_timeout=inactivity_timeout,
         )
 
 
@@ -309,6 +313,7 @@ class WebSocketWorker:
         self.payload_symbols = payload_symbols
         self._session: Optional[aiohttp.ClientSession] = None
         self._closing = asyncio.Event()
+        self._last_message_at = time.monotonic()
 
     async def start(self) -> None:
         while not self._closing.is_set():
@@ -339,21 +344,45 @@ class WebSocketWorker:
         }
         async with aiohttp.ClientSession() as session:
             self._session = session
-            async with session.ws_connect(
-                self.url,
-                heartbeat=self.settings.heartbeat,
-                receive_timeout=self.settings.heartbeat + 30,
-            ) as ws:
-                LOGGER.info("Conectado a %s", self.name)
-                await ws.send_json(payload)
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        await self._handle_text(msg.data)
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        raise RuntimeError(f"WebSocket error: {ws.exception()}")
-                    elif msg.type == aiohttp.WSMsgType.CLOSED:
-                        LOGGER.warning("WebSocket %s cerrado por el servidor", self.name)
-                        break
+            try:
+                async with session.ws_connect(
+                    self.url,
+                    heartbeat=self.settings.heartbeat,
+                    receive_timeout=self.settings.heartbeat + 30,
+                ) as ws:
+                    LOGGER.info("Conectado a %s", self.name)
+                    await ws.send_json(payload)
+                    self._last_message_at = time.monotonic()
+                    while not self._closing.is_set():
+                        try:
+                            msg = await ws.receive(timeout=self.settings.inactivity_timeout)
+                        except asyncio.TimeoutError:
+                            elapsed = time.monotonic() - self._last_message_at
+                            LOGGER.warning(
+                                "Sin mensajes de %s durante %ss (%.0fs reales). Reiniciando conexión.",
+                                self.name,
+                                self.settings.inactivity_timeout,
+                                elapsed,
+                            )
+                            break
+
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            self._last_message_at = time.monotonic()
+                            await self._handle_text(msg.data)
+                        elif msg.type == aiohttp.WSMsgType.PING:
+                            self._last_message_at = time.monotonic()
+                            await ws.pong()
+                        elif msg.type == aiohttp.WSMsgType.PONG:
+                            self._last_message_at = time.monotonic()
+                        elif msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED}:
+                            LOGGER.warning("WebSocket %s cerrado por el servidor", self.name)
+                            break
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            raise RuntimeError(f"WebSocket error: {ws.exception()}")
+                        else:
+                            LOGGER.debug("Mensaje %s ignorado en %s", msg.type, self.name)
+            finally:
+                self._session = None
 
     async def _handle_text(self, raw: str) -> None:
         try:
@@ -425,18 +454,26 @@ class TradesWorker(WebSocketWorker):
         LOGGER.debug(
             "Persistiendo trade %s %.4f x %s", mapping.local_symbol, float(price), size
         )
-        await asyncio.to_thread(
-            self.database.persist_trade,
-            asset_id=mapping.asset_id,
-            symbol=mapping.local_symbol,
-            session=market_session(),
-            price=float(price),
-            size=size,
-            condition_code=condition_code,
-            dark_pool=dark_pool,
-            market_status=market_status,
-            event_timestamp=event_ts,
-        )
+        try:
+            await asyncio.to_thread(
+                self.database.persist_trade,
+                asset_id=mapping.asset_id,
+                symbol=mapping.local_symbol,
+                session=market_session(),
+                price=float(price),
+                size=size,
+                condition_code=condition_code,
+                dark_pool=dark_pool,
+                market_status=market_status,
+                event_timestamp=event_ts,
+            )
+        except Exception as exc:
+            LOGGER.error(
+                "No se pudo insertar trade %s en base de datos: %s",
+                mapping.local_symbol,
+                exc,
+                exc_info=True,
+            )
 
 
 class QuotesWorker(WebSocketWorker):
@@ -471,20 +508,33 @@ class QuotesWorker(WebSocketWorker):
             bid_price,
             ask_price,
         )
-        await asyncio.to_thread(
-            self.database.persist_quote,
-            asset_id=mapping.asset_id,
-            symbol=mapping.local_symbol,
-            session=market_session(),
-            bid_price=float(bid_price) if bid_price is not None else None,
-            ask_price=float(ask_price) if ask_price is not None else None,
-            bid_size=bid_size,
-            ask_size=ask_size,
-            event_timestamp=event_ts,
-        )
+        try:
+            await asyncio.to_thread(
+                self.database.persist_quote,
+                asset_id=mapping.asset_id,
+                symbol=mapping.local_symbol,
+                session=market_session(),
+                bid_price=float(bid_price) if bid_price is not None else None,
+                ask_price=float(ask_price) if ask_price is not None else None,
+                bid_size=bid_size,
+                ask_size=ask_size,
+                event_timestamp=event_ts,
+            )
+        except Exception as exc:
+            LOGGER.error(
+                "No se pudo insertar quote %s en base de datos: %s",
+                mapping.local_symbol,
+                exc,
+                exc_info=True,
+            )
 
 
-async def run(settings: Settings) -> None:
+async def run(
+    settings: Settings,
+    *,
+    stop_event: Optional[asyncio.Event] = None,
+    register_signals: bool = True,
+) -> None:
     mappings_list = parse_symbol_mappings(settings.symbols_env, settings.symbol_suffix)
     mappings = {m.remote_symbol: m for m in mappings_list}
     payload_symbols = ",".join(m.remote_symbol for m in mappings_list)
@@ -512,30 +562,64 @@ async def run(settings: Settings) -> None:
         payload_symbols=payload_symbols,
     )
 
-    stop_event = asyncio.Event()
+    shutdown_event = stop_event or asyncio.Event()
 
-    def _handle_signal(signame: str) -> None:
-        LOGGER.warning("Señal %s recibida. Cerrando...")
-        stop_event.set()
+    def _notify_stop(signame: str) -> None:
+        if shutdown_event.is_set():
+            return
+        LOGGER.warning("Señal %s recibida. Cerrando...", signame)
+        shutdown_event.set()
 
-    loop = asyncio.get_running_loop()
-    for signame in {"SIGTERM", "SIGINT"}:
-        if hasattr(signal, signame):
-            loop.add_signal_handler(getattr(signal, signame), _handle_signal, signame)
+    def _sync_signal_handler(signum: int, frame) -> None:  # type: ignore[override]
+        try:
+            signame = signal.Signals(signum).name
+        except Exception:
+            signame = str(signum)
+        _notify_stop(signame)
 
-    async def _stop_on_event() -> None:
-        await stop_event.wait()
-        await asyncio.gather(trades_worker.stop(), quotes_worker.stop())
+    if register_signals:
+        loop = asyncio.get_running_loop()
+        for signame in ("SIGTERM", "SIGINT"):
+            if not hasattr(signal, signame):
+                continue
+            sig = getattr(signal, signame)
+            try:
+                loop.add_signal_handler(sig, _notify_stop, signame)
+            except NotImplementedError:
+                LOGGER.info(
+                    "add_signal_handler no disponible en esta plataforma. Usando signal.signal para %s",
+                    signame,
+                )
+                signal.signal(sig, _sync_signal_handler)
+            except RuntimeError as exc:
+                LOGGER.warning(
+                    "No se pudo registrar handler asíncrono para %s (%s). Usando signal.signal",
+                    signame,
+                    exc,
+                )
+                signal.signal(sig, _sync_signal_handler)
+
+    async def _wait_for_shutdown() -> None:
+        await shutdown_event.wait()
+
+    try:
+        await asyncio.gather(
+            trades_worker.start(),
+            quotes_worker.start(),
+            _wait_for_shutdown(),
+        )
+    finally:
+        shutdown_event.set()
+        await asyncio.gather(
+            trades_worker.stop(),
+            quotes_worker.stop(),
+            return_exceptions=True,
+        )
         database.close()
-
-    await asyncio.gather(
-        trades_worker.start(),
-        quotes_worker.start(),
-        _stop_on_event(),
-    )
 
 
 def main() -> None:
+    configure_logging()
     try:
         settings = Settings.from_env()
     except SettingsError as exc:

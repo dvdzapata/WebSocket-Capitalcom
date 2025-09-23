@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -29,8 +30,23 @@ except ImportError as exc:  # pragma: no cover - dependency runtime check
 
 CAPITAL_API_BASE = "https://api-capital.backend-capital.com/api/v1"
 CAPITAL_STREAM_URL = "wss://api-streaming-capital.backend-capital.com/connect"
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 
 
+def configure_logging() -> None:
+    """Configure root logger with unified format if needed."""
+
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = logging.getLevelName(level_name)
+    if isinstance(level, str):
+        level = logging.INFO
+
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        root_logger.addHandler(handler)
+    root_logger.setLevel(level)
 def load_dotenv(env_path: Path) -> None:
     """Simple .env loader that respects existing environment variables."""
 
@@ -63,6 +79,7 @@ class Config:
     table_name: str = "capital_market_quotes"
     ping_interval_seconds: int = 300
     reconnect_delay_seconds: int = 5
+    inactivity_timeout_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -98,6 +115,7 @@ class Config:
             table_name=os.environ.get("CAPITAL_STREAM_TABLE", "capital_market_quotes"),
             ping_interval_seconds=int(os.environ.get("CAPITAL_PING_INTERVAL", "300")),
             reconnect_delay_seconds=int(os.environ.get("CAPITAL_RECONNECT_DELAY", "5")),
+            inactivity_timeout_seconds=int(os.environ.get("CAPITAL_INACTIVITY_TIMEOUT", "60")),
         )
 
         if not cfg.target_epics:
@@ -119,6 +137,13 @@ class CapitalWebSocketStreamer:
         self.tokens: Optional[Dict[str, str]] = None
         self.ping_thread = threading.Thread(target=self._ping_loop, daemon=True)
         self.ping_thread.start()
+        self.last_message_at = time.monotonic()
+        self.watchdog_thread = threading.Thread(
+            target=self._inactivity_watchdog,
+            name="CapitalInactivityWatchdog",
+            daemon=True,
+        )
+        self.watchdog_thread.start()
 
     def _create_db_connection(self) -> psycopg2.extensions.connection:
         self.logger.info("Connecting to PostgreSQL %s:%s", self.config.db_host, self.config.db_port)
@@ -234,6 +259,7 @@ class CapitalWebSocketStreamer:
         )
         with self.ws_lock:
             self.ws_app = ws_app
+        self._mark_activity()
         try:
             ws_app.run_forever(ping_interval=None, ping_timeout=None)
         finally:
@@ -244,6 +270,7 @@ class CapitalWebSocketStreamer:
     def _on_open(self, ws: WebSocketApp) -> None:
         self.logger.info("WebSocket connection established")
         self.connected_event.set()
+        self._mark_activity()
         self._send_subscribe()
 
     def _on_close(self, ws: WebSocketApp, status_code: Optional[int], msg: Optional[str]) -> None:
@@ -255,6 +282,7 @@ class CapitalWebSocketStreamer:
         self.connected_event.clear()
 
     def _on_message(self, ws: WebSocketApp, message: str) -> None:
+        self._mark_activity()
         self.logger.debug("Received message: %s", message)
         try:
             payload = json.loads(message)
@@ -338,7 +366,7 @@ class CapitalWebSocketStreamer:
             "securityToken": self.tokens["securityToken"],
         }
         self._send_json(ping_message)
-        self.logger.info("Ping sent")
+        self.logger.debug("Ping sent")
 
     def _send_json(self, payload: Dict[str, object]) -> None:
         message = json.dumps(payload)
@@ -363,6 +391,34 @@ class CapitalWebSocketStreamer:
             self._send_ping()
         self.logger.info("Ping thread terminated")
 
+    def _mark_activity(self) -> None:
+        self.last_message_at = time.monotonic()
+
+    def _inactivity_watchdog(self) -> None:
+        while not self.stop_event.wait(timeout=5):
+            if not self.connected_event.is_set():
+                continue
+            elapsed = time.monotonic() - self.last_message_at
+            if elapsed >= self.config.inactivity_timeout_seconds:
+                self.logger.warning(
+                    "No messages received in %.0f seconds. Forcing reconnection.",
+                    elapsed,
+                )
+                self._force_reconnect()
+
+    def _force_reconnect(self) -> None:
+        with self.ws_lock:
+            ws = self.ws_app
+        if ws is None:
+            return
+        try:
+            ws.close()
+        except Exception:
+            self.logger.exception("Error closing WebSocket during inactivity restart")
+        finally:
+            self.connected_event.clear()
+            self.last_message_at = time.monotonic()
+
     def _persist_record(self, record: Dict[str, object]) -> None:
         columns = (
             "asset_id",
@@ -383,14 +439,14 @@ class CapitalWebSocketStreamer:
         try:
             with self.db_conn.cursor() as cur:
                 cur.execute(insert_sql, values)
-            self.logger.info(
+            self.logger.debug(
                 "Stored quote %s at %s (asset_id=%s)",
                 record["symbol"],
                 record["timestamp"].isoformat(),
                 record["asset_id"],
             )
         except Exception as exc:
-            self.logger.exception("Failed to persist record: %s", exc)
+            self.logger.error("Failed to persist record: %s", exc, exc_info=True)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -403,6 +459,8 @@ class CapitalWebSocketStreamer:
                     self.logger.exception("Error closing WebSocket")
         if self.ping_thread.is_alive() and threading.current_thread() is not self.ping_thread:
             self.ping_thread.join(timeout=5)
+        if self.watchdog_thread.is_alive() and threading.current_thread() is not self.watchdog_thread:
+            self.watchdog_thread.join(timeout=5)
         if self.db_conn:
             try:
                 self.db_conn.close()
@@ -420,11 +478,8 @@ def _to_float(value: Optional[object]) -> Optional[float]:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
     load_dotenv(Path(".env"))
+    configure_logging()
     config = Config.from_env()
     streamer = CapitalWebSocketStreamer(config)
 
